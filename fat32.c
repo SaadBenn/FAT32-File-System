@@ -1,289 +1,423 @@
-#include <assert.h>
-#include <stdio.h>
+#define _FILE_OFFSET_BITS 64
+#define SECTOR_LENGTH 512
+
 #include <stdlib.h>
-#include <string.h>
-#include <fcntl.h>
-#include <ctype.h>
+#include <stdio.h>
 #include <sys/stat.h>
-#include <sys/mman.h>
-
-#include "fat_fs.h"
+#include <fcntl.h>
+#include <assert.h>
+#include <stdbool.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <time.h>
+#include <limits.h>
 #include "fat32.h"
+#include "fat_fs.h"
 
-int main(int argc, char *argv[]) {
-	
-	FS_Instance *fat32_instance;
-	FS_CurrentDir current_dir;
-	// check the required arguments
-	if (argc != 3) {
-		perror("Usage: <./fat32 imagename func>\n");
-		exit(EXIT_FAILURE);
-	}
 
-	// create fat32 instance for processing
-	fat32_instance = fs_create_instance(argv[1]);
-	if (fat32_instance == NULL) {
-		perror("Could not create the fat32 instance\n");
-		exit(EXIT_FAILURE);
-	}
+#define CMD_INFO "info"
+#define CMD_LIST "list"
+#define CMD_GET "get"
+#define FILE_NAME_LENGTH 8
+#define EXTENSION_LENGTH 3
 
-	current_dir = fs_get_root(fat32_instance);
-	char *buffer = argv[2];
+#define DIRECTORY_ENTRY_FREE 0xE5
+#define ELEVEN 11
+#define MASKBY 16
+#define ATTR_DIRECTORY 0x10
+#define ATTR_ARCHIVE 0x20
 
-	// Make the string uppercase
-	int i;
-	for (i = 0; i < strlen(buffer) + 1; i++) {
-		buffer[i] = toupper(buffer[i]);
-	}
+int fd;
+char *file_name;
+char *pathToFile;
+bool fileFound = false;
+char buffer[SECTOR_LENGTH];
+char *path;
 
-	// print the info
-	if (strncmp(buffer, CMD_INFO, strlen(CMD_INFO)) == 0) {
-		print_info(fat32_instance);
-	}
+// global var for equations
+uint32_t total_root_ent_cnt;
+uint32_t byte_per_sec_off_by_1;
+uint32_t root_dir_sectors;
+uint32_t first_data_sector;
+uint32_t total_Dir_Number;
 
-	// check for "LIST" cmd....
-	// loop through the FAT and print the directories/files in tree like structure
+fat32BS *boot_sector;
+Dir_Info *curr_dir;
+FS_Info *fs_info;
 
-	return 0;
+uint32_t rootCluster;
+
+int main(int argc, char *argv[])
+{
+    //VolumeName = (char *)malloc(sizeof(char) * 100);
+    
+    file_name = argv[1];
+    
+    // allocate space for the boot sector
+    boot_sector = (fat32BS *)malloc(sizeof(fat32BS));
+    
+    // allocate space for the structures
+    fs_info = malloc(sizeof(FS_Info));
+    curr_dir = malloc(sizeof(Dir_Info));
+    
+    if (argc < 3) {
+        printf("Usage: compiled file name <image name> <Command to execute>");
+        exit(1);
+    
+    } else {
+        
+        fd = open(file_name, O_RDONLY);
+        
+        // read the boot sector
+        read(fd, buffer, sizeof(fat32BS));
+        memcpy(boot_sector, buffer, sizeof(fat32BS));
+        
+        // get the root sector
+        rootCluster = boot_sector->BPB_RootClus;
+        
+        // read the file system information
+        read(fd, buffer, sizeof(FS_Info));
+        memcpy(fs_info, buffer, sizeof(FS_Info));
+        
+        
+        // constant global values
+        total_root_ent_cnt = boot_sector->BPB_RootEntCnt * 32;
+        byte_per_sec_off_by_1 = boot_sector->BPB_BytesPerSec - 1;
+        root_dir_sectors = (total_root_ent_cnt + byte_per_sec_off_by_1) / boot_sector->BPB_BytesPerSec;
+        first_data_sector = boot_sector->BPB_RsvdSecCnt + (boot_sector->BPB_NumFATs * boot_sector->BPB_FATSz32) + root_dir_sectors;
+        total_Dir_Number = (boot_sector->BPB_SecPerClus * boot_sector->BPB_BytesPerSec) / sizeof(Dir_Info);
+        
+        // get the argument
+        char *command_to_execute = argv[2];
+        switch (argc) {
+            case 3:
+                if (strcmp(command_to_execute, CMD_INFO) == 0) {
+                    print_info(boot_sector);
+                } else if (strcmp(command_to_execute, CMD_LIST) == 0) {
+                    
+                    // print_root info
+                    uint32_t first_data_sector = get_sector_of_cluster(boot_sector, rootCluster);
+                    uint32_t dir_offset = first_data_sector * boot_sector->BPB_BytesPerSec;
+                    
+                    // seek to the location and read it into the buffer
+                    lseek(fd, dir_offset, SEEK_SET);
+                    read(fd, buffer, sizeof(Dir_Info));
+                    memcpy(curr_dir, buffer, sizeof(Dir_Info));
+                    
+                    printf("Root Directory: %.*s\n", ELEVEN, curr_dir->DIR_Name);
+                    
+                    // print the inner directories
+                    print_dir_recursively(boot_sector, rootCluster, 0);
+                }
+                break;
+                
+            case 4:
+                if (strcmp(command_to_execute, CMD_GET) == 0) {
+                    
+                    // global var for path
+                    path = argv[3];
+                    
+                    if (path != NULL && strlen(path) > 0) {
+                        getFileContent(boot_sector, rootCluster);
+                        if(fileFound == false) {
+                            printf("%s\n","File not found");
+                        }
+                    } // if
+                } else {
+                    printf("%s\n","Invalid command");
+                }
+                break;
+            default:
+                printf("Usage: compiled file name <image name> <info OR list OR get path/to/file>");
+                exit(1);
+        }
+    }
+    
+    // clean up resources
+    free(boot_sector);
+    free(curr_dir);
+    free(fs_info);
+    printf("%s\n", "Program ended successfully");
+    return 0;
 } // close main
 
 
-static uint32_t cluster_to_sector(FS_Instance *fat_fs, uint32_t cluster) {
-  fat32BS *bs = (fat32BS *)fat_fs->image;
-
-	return ((cluster - 2) * bs->BPB_SecPerClus) + fat_fs->FirstDataSector;
-}
-
-
-static int is_eoc(FS_Instance *fat_fs, uint32_t cluster) {
-  return (FS_FAT32 == fat_fs->fs_type) ? (0x0FFFFFFF == cluster) : (FS_FAT16 == fat_fs->fs_type) ? (0xFFFF == cluster) : (0x0FFF == cluster);
-}
-
-
-static uint32_t iterate_chain(FS_Instance *fat_fs, uint32_t cluster) {
-  assert(NULL != fat_fs);
-  
-  fat32BS *bs = (fat32BS *)fat_fs->image;
-
-  // pp 15-17
-  uint32_t fat_offset, this_fat_sec_num, this_fat_ent_offset;
-  uint8_t *sec_buff;
-
-  if (FS_FAT12 == fat_fs->fs_type)
-    fat_offset = cluster + (cluster / 2);
-  else if (FS_FAT16 == fat_fs->fs_type)
-    fat_offset = cluster * 2;
-  else
-    fat_offset = cluster * 4;
-
-  this_fat_sec_num = bs->BPB_RsvdSecCnt + (fat_offset / bs->BPB_BytesPerSec);
-  this_fat_ent_offset = fat_offset % bs->BPB_BytesPerSec;
-  sec_buff = fat_fs->image + this_fat_sec_num * bs->BPB_BytesPerSec;
-
-  if (FS_FAT12 == fat_fs->fs_type) {
-    if (cluster & 0x0001) {
-      cluster = (*(uint16_t *)&sec_buff[this_fat_ent_offset]) >> 4;
-    } else {
-      cluster = (*(uint16_t *)&sec_buff[this_fat_ent_offset]) & 0x0fff;
-    }
-  } else {
-     uint32_t fat_sz;
-     if (bs->BPB_FATSz16 != 0)
-       fat_sz = bs->BPB_FATSz16;
-     else
-       fat_sz = bs->BPB_FATSz32;
+void print_contents_of_the_file(fat32BS *bs, uint32_t clus_num, char *file_name) {
+    uint32_t first_sector_of_file = get_sector_of_cluster(bs, clus_num);
+    uint32_t file_offset = first_sector_of_file * bs->BPB_BytesPerSec;
+    uint32_t clus_size = bs->BPB_SecPerClus * bs->BPB_BytesPerSec;
     
-    if (FS_FAT16 == fat_fs->fs_type)
-      cluster = *((uint16_t *) &sec_buff[this_fat_ent_offset]);
-    else
-      cluster = (*((uint32_t *) &sec_buff[this_fat_ent_offset])) & 0x0FFFFFFF;
-  }
-  
-  return cluster;
-}
-
-
-static fatEntry *iterate_dir(FS_Instance *fat_fs, uint32_t *cluster, fatEntry *i, uint32_t *bytes_left) {
-  assert(NULL != fat_fs);
-  
-  fat32BS *bs = (fat32BS *)fat_fs->image;
-	int sector, first = 0;
-
-	if (NULL == i) {
-    *bytes_left = 0;
-		first = 1;
-	}
-	
-	do {
-  	if (*bytes_left < sizeof(fatEntry)) {
-      if (1 == *cluster) {
-        // root on FAT12/16
-        sector = bs->BPB_RsvdSecCnt + (bs->BPB_NumFATs * bs->BPB_FATSz16);
-        if (first) {
-          *bytes_left = fat_fs->RootDirSectors * bs->BPB_BytesPerSec;
-        } else {
-    			*bytes_left = 0;
-    			return NULL;
-        }
-      } else {
-        // chained directory
-        sector = cluster_to_sector(fat_fs, *cluster);
-        if (!first) {
-          *cluster = iterate_chain(fat_fs, *cluster);
-          if (is_eoc(fat_fs, *cluster)) {
-      			*bytes_left = 0;
-      			return NULL;
-          }
-          sector = cluster_to_sector(fat_fs, *cluster);
-        }
-        *bytes_left = bs->BPB_SecPerClus * bs->BPB_BytesPerSec;
-      }
-  		i = (void *)bs + sector * bs->BPB_BytesPerSec;
-  		first = 1;
-		}
-		if (!first) {
-			i++;
-		}
-		*bytes_left = *bytes_left - sizeof(fatEntry);
-	} while ((i->DIR_Name[0] > 0x00 && i->DIR_Name[0] <= 0x20) || 0xe5 == i->DIR_Name[0]);
-	
-	if (0x00 == i->DIR_Name[0]) {
-		return NULL;
-	}
-	
-	return i;
-}
-
-
-static uint32_t free_sectors(FS_Instance *fat_fs) {
-  uint32_t free_count = 0;
-
-  fat32BS *bs = (fat32BS *)fat_fs->image;
-  
-  for (uint32_t cluster = 0; cluster < fat_fs->DataSec / bs->BPB_SecPerClus; cluster++) {
-    if (0 == iterate_chain(fat_fs, cluster + FIRST_DATA_CLUSTER)) {
-      free_count++;
+    char *file_buffer = seek_and_read_file_contents(clus_size, file_offset);
+    
+    if (file_buffer != NULL && strlen(file_buffer) > 0) {
+        printf("Started reading contents of the file: %s\n", file_name);
+        printf("--------------\n");
+        
+        int i = 0;
+        for (; file_buffer[i] != 0x00; i++) {
+            printf("%c", file_buffer[i]);
+        } // for
+        printf("\n--------------\n");
+        printf("%s\n", "Finished reading contents of the file");
     }
-  }
-  return free_count;
-} // free_sectors
+    
+} // close print_contents_of_the_file
 
 
-FS_Instance *fs_create_instance(char *image_path) {
-	assert(NULL != image_path);
-
-	FS_Instance *fat_fs;
-	int fd;
-	struct stat fd_stat;
-	uint8_t *image;
-
-	fd = open(image_path, O_RDONLY);
-	if (fd < 0) {
-	perror("Error opening file");
-	return NULL;
-	}
-
-	if (fstat(fd, &fd_stat) < 0) {
-	perror("Error getting file information");
-	return NULL;
-	}
-
-	image = mmap(0, fd_stat.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-	if (NULL == image) {
-	perror("Error mapping file");
-	return NULL;
-	}
-
-	fat_fs = malloc(sizeof(FS_Instance));
-	fat_fs->image_path = malloc(strlen(image_path + 1));
-	strcpy(fat_fs->image_path, image_path);
-	fat_fs->image = image;
-
-	fat32BS *bs = (fat32BS *)image;
-	uint32_t FATSz, TotSec, CountofClusters;
-
-	FATSz = bs->BPB_FATSz32;
-	TotSec = bs->BPB_TotSec32;
-
-	fat_fs->RootDirSectors = ((bs->BPB_RootEntCnt * 32) + (bs->BPB_BytesPerSec - 1)) / bs->BPB_BytesPerSec;
-	fat_fs->FirstDataSector = bs->BPB_RsvdSecCnt + (bs->BPB_NumFATs * FATSz) + fat_fs->RootDirSectors;
-	fat_fs->DataSec = TotSec - (bs->BPB_RsvdSecCnt + (bs->BPB_NumFATs * FATSz) + fat_fs->RootDirSectors);
-	CountofClusters = fat_fs->DataSec / bs->BPB_SecPerClus;
-
-	if (CountofClusters < 4085) {
-		/* Volume is FAT12 */
-		fat_fs->fs_type = FS_FAT12;
-	} else if(CountofClusters < 65525) {
-	/* Volume is FAT16 */
-		fat_fs->fs_type = FS_FAT16;
-	} else {
-	/* Volume is FAT32 */
-		fat_fs->fs_type = FS_FAT32;
-	}
-
-	fatEntry *dir = NULL;
-	uint32_t bytes_left;
-	FS_CurrentDir root = fs_get_root(fat_fs);
-
-	fat_fs->volume_id[0] = '\0';
-	while (NULL != (dir = iterate_dir(fat_fs, &root, dir, &bytes_left))) {
-		if (ATTR_VOLUME_ID == dir->DIR_Attr) {
-			strncpy(fat_fs->volume_id, (char *)dir->DIR_Name, DIR_Name_LENGTH);
-			fat_fs->volume_id[DIR_Name_LENGTH] = '\0';
-			break;
-		}
-	}
-
-	return fat_fs;
-}
+char *seek_and_read_file_contents(uint32_t clus_size, uint32_t file_offset) {
+    char *file_buffer = malloc(sizeof(char) * clus_size);
+    lseek(fd, file_offset, SEEK_SET);
+    read(fd, file_buffer, clus_size);
+    return file_buffer;
+} // close seek_and_read_file_contents
 
 
-FS_CurrentDir fs_get_root(FS_Instance *fat_fs) {
-	// TODO: FAT32
-  assert(NULL != fat_fs);
-  
-  if (FS_FAT32 == fat_fs->fs_type) {
-    fat32BS *bs = (fat32BS *)fat_fs->image;
-    return bs->BPB_RootClus;
-  } 
-  return -1;
-}
+uint32_t get_dir_offset(fat32BS *bs, uint32_t cluster_num) {
+    uint32_t first_data_sector = get_sector_of_cluster(bs, cluster_num);
+    uint32_t dir_offset = first_data_sector * bs->BPB_BytesPerSec;
+    return dir_offset;
+} // close get_dir_offset
 
 
-void print_info(FS_Instance *fat_fs) {
-	assert(NULL != fat_fs);
+void seek(int i, uint32_t dir_offset) {
+    // seek to the location and read the data into a buffer
+    lseek(fd, dir_offset + (i * sizeof(Dir_Info)), SEEK_SET);
+    read(fd, buffer, sizeof(Dir_Info));
+    memcpy(curr_dir, buffer, sizeof(Dir_Info));
+} // close seek
 
-	fat32BS *bs = (fat32BS *)fat_fs->image;
 
-	printf("\nVolume information for: %s\n", fat_fs->image_path);
+void name_parser(char *name) {
+    name = strtok(name, " ");
+    // terminate with null byte
+    name[strlen(name)] = '\0';
+} // close name_parser
 
-	printf("\nDisk information:\n");
-	printf("-----------------\n");
 
-	printf("OEM Name: %.8s\n", bs->BS_OEMName);
-	printf("Volume Label: %.11s\n", bs->BS_VolLab);
-	printf("File System Type (text): %.8s\n", bs->BS_FilSysType);
-	printf("Media Type: 0x%X (%s)\n", bs->BPB_Media, (MEDIA_FIXED == bs->BPB_Media)?"fixed":(MEDIA_REMOVABLE == bs->BPB_Media)?"removable":"unknown");
+int print_dir_recursively(fat32BS *bs, uint32_t cluster_num, uint32_t indent) {
+    
+    uint32_t dir_offset = get_dir_offset(bs, cluster_num);
 
-	long long totalB = (0 == bs->BPB_TotSec32) ? bs->BPB_TotSec16 : bs->BPB_TotSec32;
-	totalB *= bs->BPB_BytesPerSec;
-	double totalMB = totalB/1000000.0;
-	printf("Size: %lld bytes (%.2fMB)\n", totalB, totalMB);
+    int i;
+    for (i = 0; i < total_Dir_Number; i++) {
+        
+        seek(i, dir_offset);
+        
+        // variables for checking dir name + attribute
+        char *dir_name_check = curr_dir->DIR_Name[0];
+        char *curr_dir_attr = curr_dir->DIR_Attr;
+        
+        bool result = is_directory(curr_dir);
+        if (result) {
+            if (curr_dir_attr == MASKBY && (dir_name_check != DIRECTORY_ENTRY_FREE)) {
+                
+                print_dash(indent);
+                char *dir_name = curr_dir->DIR_Name;
+                printf("Directory Name: %.*s\n", ELEVEN, dir_name);
+                
+                // mask the bits and get the next cluster
+                uint32_t next_cluster_number_dir = curr_dir->DIR_FstClusHI << MASKBY | curr_dir->DIR_FstClusLO;
+                
+                // call the recursive function
+                print_dir_recursively(bs, next_cluster_number_dir, indent++);
+                
+            } else if (dir_name_check != DIRECTORY_ENTRY_FREE) {
+                char *name = malloc(sizeof(8));
+                char *ext = malloc(sizeof(3));
+                
+                char *dir_name = curr_dir->DIR_Name;
+                
+                // copy the name + the extension
+                strncpy(name, dir_name, 8);
+                strncpy(ext, dir_name + 8, 3);
+                
+                // tokenize the name
+                name_parser(name);
+                
+                print_dash(indent);
+                printf("File: %s.%s\n", name, ext);
+            }
+        }
+    }
+    
+    // check if we have a cluster chain
+    uint32_t next_cluster = check_chain(bs, cluster_num);
+    
+    // mask the first 4 bits
+    next_cluster = next_cluster & 0xfffffff;
+    
+    if (next_cluster != 0xffffff8 && next_cluster != 0xfffffff) {
+        print_dir_recursively(bs, next_cluster, indent);
+    }
+    return 0;
+} // close print_dir_recursively
 
-	printf("\nDisk geometry:\n");
-	printf("--------------\n");
 
-	printf("Bytes Per Sector: %d\n", bs->BPB_BytesPerSec);
-	printf("Sectors Per Cluster: %d\n", bs->BPB_SecPerClus);
-	printf("Total Sectors: %d\n", (0 == bs->BPB_TotSec32) ? bs->BPB_TotSec16 : bs->BPB_TotSec32);
-	printf("Physical - Sectors per Track: %d\n", bs->BPB_SecPerTrk);
-	printf("Physical - Heads: %d\n", bs->BPB_NumHeads);
+bool is_directory(Dir_Info *currDir) {
+    bool result = false;
+    result = (currDir->DIR_Attr == ATTR_DIRECTORY || currDir->DIR_Attr == ATTR_ARCHIVE) && currDir->DIR_Name[0] != '.' && currDir->DIR_Name[0] != 0xFFFFFFE5;
+    return result;
+} // close is_directory
 
-	printf("\nFile system info:\n");
-	printf("----------------\n");
 
-	printf("Volume ID: %s\n", fat_fs->volume_id);
-	printf("File System Type (calculated): %s\n", (FS_FAT12 == fat_fs->fs_type)?"FAT12":(FS_FAT16 == fat_fs->fs_type)?"FAT16":"FAT_32");
-	printf("FAT Size (sectors): %d\n", bs->BPB_FATSz32);
-	//printf("Free space: %d bytes\n", free_sectors(fat_fs) * bs->BPB_BytsPerSec);
-}
+uint32_t get_sector_of_cluster(fat32BS *bs, uint32_t n) {
+    // Microsoft fat32 white paper equation
+    uint32_t data_sector = ((n - 2) * bs->BPB_SecPerClus) + first_data_sector;
+    return data_sector;
+} // close get_sector_of_cluster
+
+
+char *tokenize_path() {
+    char *tokenize_path_copy = malloc(strlen(path));
+    
+    char *dir_file_name = "";
+    tokenize_path_copy = strdup(path);
+    
+    dir_file_name = tokenize_dir_file_name(tokenize_path_copy);
+    
+    if (dir_file_name != NULL && strlen(dir_file_name) > 0) {
+        unsigned long path_len = strlen(path);
+        unsigned long dir_len = strlen(dir_file_name);
+        
+        // get the new path after tokenzing
+        char *new_path = malloc(sizeof(100));
+        memcpy(new_path, path+dir_len+1, path_len-dir_len);
+        path = strdup(new_path);
+    } // if
+    return dir_file_name;
+} // close tokenize_path
+
+
+char *tokenize_dir_file_name(char *tokenize_path_copy) {
+    char *dir_file_name = malloc(sizeof(64));
+    dir_file_name = strtok(tokenize_path_copy, "/");
+    dir_file_name[strlen(dir_file_name)] = '\0';
+    return dir_file_name;
+} // close tokenize_dir_file_name
+
+
+uint32_t check_chain(fat32BS *bs, uint32_t cluster_number) {
+    uint32_t FATOffset = 0;
+    
+    // asuming the file type is always fat32
+    FATOffset = cluster_number * 4;
+    
+    // equations from the white paper
+    uint32_t ThisFATSecNum = bs->BPB_RsvdSecCnt + (FATOffset / bs->BPB_BytesPerSec);
+    uint32_t ThisFATEntOffset = FATOffset % bs->BPB_BytesPerSec;
+    
+    // store the next cluster
+    uint32_t next_cluster;
+    
+    lseek(fd, (bs->BPB_BytesPerSec * ThisFATSecNum) + ThisFATEntOffset, SEEK_SET);
+    // read in four bytes only in FAT
+    read(fd, &next_cluster, 4);
+    
+    return next_cluster;
+} // close check_chain
+
+
+void print_info(fat32BS *bs) {
+    
+    uint32_t totalSize = (bs->BPB_TotSec32 * bs->BPB_BytesPerSec) / 1024;
+    uint32_t totalReserved = ((bs->BPB_RsvdSecCnt + bs->BPB_NumFATs * bs->BPB_FATSz32) * bs->BPB_BytesPerSec) / 1024;
+    uint32_t freeSpace = (fs_info->FSI_Free_Count * bs->BPB_SecPerClus * bs->BPB_BytesPerSec) / 1024;
+    float clusterSizeInKB = (float)(bs->BPB_SecPerClus * bs->BPB_BytesPerSec) / 1024.00;
+    
+    
+    printf("\nDisk information:\n");
+    printf("-----------------\n");
+    printf("OEM Name: %.8s\n", bs->BS_OEMName);
+    printf("Volume Label: %.11s\n", bs->BS_VolLab);
+    printf("File System Type (text): %.8s\n", bs->BS_FilSysType);
+    
+    printf("\nDisk geometry:\n");
+    printf("--------------\n");
+    
+    printf("Bytes Per Sector: %d\n", bs->BPB_BytesPerSec);
+    printf("Sectors Per Cluster: %d\n", bs->BPB_SecPerClus);
+    printf("Total Sectors: %d\n", (0 == bs->BPB_TotSec32) ? bs->BPB_TotSec16 : bs->BPB_TotSec32);
+    printf("Physical - Sectors per Track: %d\n", bs->BPB_SecPerTrk);
+    printf("Physical - Heads: %d\n", bs->BPB_NumHeads);
+    
+    printf("\nSize info:\n");
+    printf("--------------\n");
+    printf("Total size: %dKB\n", totalSize);
+    printf("Free space on the drive: %uKB\n", freeSpace);
+    printf("Usuable space on the drive: %uKB\n", totalSize - totalReserved);
+    printf("The cluster size in number of sectors: %d\n", bs->BPB_SecPerClus);
+    printf("The cluster size in number of sectors: %3.1fKB\n", clusterSizeInKB);
+    printf("--------------\n");
+} // close print_info
+
+
+void print_dash(int indent) {
+    int i;
+    for (i = 0; i < indent; i++) {
+        printf("-");
+    } // end for
+} // close print_dash
+
+
+void getFileContent(fat32BS *bpb, uint32_t clusterNum) {
+    char *copyPath = (char *)malloc(strlen(path));
+    copyPath = strdup(path);
+    char * fileName = tokenize_path();
+    
+    uint32_t firstDataSector = get_sector_of_cluster(bpb, clusterNum);
+    uint32_t dir_offset = firstDataSector * bpb->BPB_BytesPerSec;
+    
+    int i = 0;
+    for (; i < total_Dir_Number; i++) {
+        seek(i, dir_offset);
+        
+        uint32_t dir_attr = curr_dir->DIR_Attr;
+        
+        bool result = is_directory(curr_dir);
+        if (result) {
+            char *dirName = malloc(sizeof(FILE_NAME_LENGTH));
+            strncpy(dirName, curr_dir->DIR_Name, FILE_NAME_LENGTH);
+            dirName = strtok(dirName, " ");
+            
+            if (dir_attr == 16 && (curr_dir->DIR_Name[0] != 0xe5) && strcasecmp(dirName, fileName) == 0) {
+                uint32_t clusterNumber_Dir = curr_dir->DIR_FstClusHI << MASKBY | curr_dir->DIR_FstClusLO;
+                getFileContent(bpb, clusterNumber_Dir);
+            } else if (curr_dir->DIR_Name[0] != 0xe5) {
+                char *name = malloc(sizeof(FILE_NAME_LENGTH));
+                char *extension = malloc(sizeof(EXTENSION_LENGTH));
+                
+                strncpy(name, curr_dir->DIR_Name, FILE_NAME_LENGTH);
+                strncpy(extension, curr_dir->DIR_Name + FILE_NAME_LENGTH, EXTENSION_LENGTH);
+                name = strtok(name, " ");
+                char *fileNameToCheck = (char *)malloc(sizeof(FILE_NAME_LENGTH + EXTENSION_LENGTH));
+                
+                strcat(fileNameToCheck, name);
+                strcat(fileNameToCheck, ".");
+                strcat(fileNameToCheck, extension);
+                if (strcasecmp(fileNameToCheck, fileName) == 0) {
+                    
+                    uint32_t clusterNumber_File = curr_dir->DIR_FstClusHI << MASKBY | curr_dir->DIR_FstClusLO;;
+                    
+                    print_contents_of_the_file(bpb, clusterNumber_File, fileNameToCheck);
+                    uint32_t next_cluster = check_chain(bpb, clusterNumber_File);
+                    
+                    // mask the first 4 bits
+                    next_cluster = next_cluster & 0xfffffff;
+                    while (next_cluster == 0xffffff8 || next_cluster == 0xfffffff) {
+                        print_contents_of_the_file(bpb, next_cluster, fileNameToCheck);
+                        next_cluster = check_chain(bpb, next_cluster);
+                        next_cluster = next_cluster & 0xfffffff;
+                    }
+                    fileFound = true;
+                    return;
+                }
+            }
+        }
+    }
+    uint32_t next_cluster = check_chain(bpb, clusterNum);
+    next_cluster = next_cluster & 0xfffffff;
+    if (next_cluster != 0xffffff8 && next_cluster != 0xfffffff) {
+        getFileContent(bpb, next_cluster);
+    }
+} // close getFileContent
