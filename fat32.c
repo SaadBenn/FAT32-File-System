@@ -1,3 +1,10 @@
+/*
+ Name: Saad Mushtaq
+ COMP 3430 Operating System
+ Robert Guderian
+ Assignment 4
+ */
+
 #define _FILE_OFFSET_BITS 64
 #define SECTOR_LENGTH 512
 
@@ -27,6 +34,9 @@
 #define MASKBY 16
 #define ATTR_DIRECTORY 0x10
 #define ATTR_ARCHIVE 0x20
+#define MASKFIRST4BITS 0xfffffff
+#define ENDOFCLUSTERCHAIN 0xffffff8
+#define SIXTEEN 16
 
 int fd;
 char *file_name;
@@ -48,9 +58,7 @@ FS_Info *fs_info;
 
 uint32_t rootCluster;
 
-int main(int argc, char *argv[])
-{
-    //VolumeName = (char *)malloc(sizeof(char) * 100);
+int main(int argc, char *argv[]) {
     
     file_name = argv[1];
     
@@ -79,7 +87,6 @@ int main(int argc, char *argv[])
         // read the file system information
         read(fd, buffer, sizeof(FS_Info));
         memcpy(fs_info, buffer, sizeof(FS_Info));
-        
         
         // constant global values
         total_root_ent_cnt = boot_sector->BPB_RootEntCnt * 32;
@@ -119,10 +126,14 @@ int main(int argc, char *argv[])
                     path = argv[3];
                     
                     if (path != NULL && strlen(path) > 0) {
-                        getFileContent(boot_sector, rootCluster);
+                        printf("Started reading contents of the file\n");
+                        printf("--------------\n");
+                        traverse_for_file(boot_sector, rootCluster);
                         if(fileFound == false) {
                             printf("%s\n","File not found");
                         }
+                        printf("\n--------------\n");
+                        printf("%s\n", "Finished reading contents of the file");
                     } // if
                 } else {
                     printf("%s\n","Invalid command");
@@ -151,15 +162,10 @@ void print_contents_of_the_file(fat32BS *bs, uint32_t clus_num, char *file_name)
     char *file_buffer = seek_and_read_file_contents(clus_size, file_offset);
     
     if (file_buffer != NULL && strlen(file_buffer) > 0) {
-        printf("Started reading contents of the file: %s\n", file_name);
-        printf("--------------\n");
-        
         int i = 0;
         for (; file_buffer[i] != 0x00; i++) {
             printf("%c", file_buffer[i]);
         } // for
-        printf("\n--------------\n");
-        printf("%s\n", "Finished reading contents of the file");
     }
     
 } // close print_contents_of_the_file
@@ -199,8 +205,8 @@ int print_dir_recursively(fat32BS *bs, uint32_t cluster_num, uint32_t indent) {
     
     uint32_t dir_offset = get_dir_offset(bs, cluster_num);
 
-    int i;
-    for (i = 0; i < total_Dir_Number; i++) {
+    int i = 0;;
+    for (; i < total_Dir_Number; i++) {
         
         seek(i, dir_offset);
         
@@ -223,18 +229,13 @@ int print_dir_recursively(fat32BS *bs, uint32_t cluster_num, uint32_t indent) {
                 print_dir_recursively(bs, next_cluster_number_dir, indent++);
                 
             } else if (dir_name_check != DIRECTORY_ENTRY_FREE) {
-                char *name = malloc(sizeof(8));
-                char *ext = malloc(sizeof(3));
-                
+            
                 char *dir_name = curr_dir->DIR_Name;
-                
-                // copy the name + the extension
-                strncpy(name, dir_name, 8);
-                strncpy(ext, dir_name + 8, 3);
+                char *name = name_copier(dir_name, false);
+                char *ext = name_copier(dir_name, true);
                 
                 // tokenize the name
                 name_parser(name);
-                
                 print_dash(indent);
                 printf("File: %s.%s\n", name, ext);
             }
@@ -245,13 +246,29 @@ int print_dir_recursively(fat32BS *bs, uint32_t cluster_num, uint32_t indent) {
     uint32_t next_cluster = check_chain(bs, cluster_num);
     
     // mask the first 4 bits
-    next_cluster = next_cluster & 0xfffffff;
+    next_cluster = next_cluster & MASKFIRST4BITS;
     
-    if (next_cluster != 0xffffff8 && next_cluster != 0xfffffff) {
+    if (next_cluster != ENDOFCLUSTERCHAIN && next_cluster != MASKFIRST4BITS) {
         print_dir_recursively(bs, next_cluster, indent);
     }
     return 0;
 } // close print_dir_recursively
+
+
+char *name_copier(char *dir_name, bool is_ext) {
+    
+    char *name = "";
+    // copy the name + the extension
+    if (!is_ext) {
+        name = malloc(sizeof(FILE_NAME_LENGTH));
+        strncpy(name, dir_name, FILE_NAME_LENGTH);
+        return name;
+    } else {
+        name = malloc(sizeof(EXTENSION_LENGTH));
+        strncpy(name, dir_name + FILE_NAME_LENGTH, EXTENSION_LENGTH);
+    }
+    return name;
+} // close name_copier
 
 
 bool is_directory(Dir_Info *currDir) {
@@ -291,8 +308,10 @@ char *tokenize_path() {
 
 char *tokenize_dir_file_name(char *tokenize_path_copy) {
     char *dir_file_name = malloc(sizeof(64));
-    dir_file_name = strtok(tokenize_path_copy, "/");
-    dir_file_name[strlen(dir_file_name)] = '\0';
+    if (tokenize_path_copy != NULL && strlen(tokenize_path_copy) > 0) {
+        dir_file_name = strtok(tokenize_path_copy, "/");
+        dir_file_name[strlen(dir_file_name)] = '\0';
+    }
     return dir_file_name;
 } // close tokenize_dir_file_name
 
@@ -344,10 +363,10 @@ void print_info(fat32BS *bs) {
     printf("\nSize info:\n");
     printf("--------------\n");
     printf("Total size: %dKB\n", totalSize);
-    printf("Free space on the drive: %uKB\n", freeSpace);
-    printf("Usuable space on the drive: %uKB\n", totalSize - totalReserved);
     printf("The cluster size in number of sectors: %d\n", bs->BPB_SecPerClus);
+    printf("Usable space on the drive: %uKB\n", totalSize - totalReserved);
     printf("The cluster size in number of sectors: %3.1fKB\n", clusterSizeInKB);
+    printf("Free space on the drive: %uKB\n", freeSpace);
     printf("--------------\n");
 } // close print_info
 
@@ -360,13 +379,13 @@ void print_dash(int indent) {
 } // close print_dash
 
 
-void getFileContent(fat32BS *bpb, uint32_t clusterNum) {
-    char *copyPath = (char *)malloc(strlen(path));
+void traverse_for_file(fat32BS *bs, uint32_t clus_num) {
+    char *copyPath = malloc(strlen(path));
     copyPath = strdup(path);
     char * fileName = tokenize_path();
     
-    uint32_t firstDataSector = get_sector_of_cluster(bpb, clusterNum);
-    uint32_t dir_offset = firstDataSector * bpb->BPB_BytesPerSec;
+    uint32_t firstDataSector = get_sector_of_cluster(bs, clus_num);
+    uint32_t dir_offset = firstDataSector * bs->BPB_BytesPerSec;
     
     int i = 0;
     for (; i < total_Dir_Number; i++) {
@@ -378,36 +397,41 @@ void getFileContent(fat32BS *bpb, uint32_t clusterNum) {
         if (result) {
             char *dirName = malloc(sizeof(FILE_NAME_LENGTH));
             strncpy(dirName, curr_dir->DIR_Name, FILE_NAME_LENGTH);
+            
+            // get the name using space as a delimiter
             dirName = strtok(dirName, " ");
             
-            if (dir_attr == 16 && (curr_dir->DIR_Name[0] != 0xe5) && strcasecmp(dirName, fileName) == 0) {
+            if (dir_attr == SIXTEEN && (curr_dir->DIR_Name[0] != DIRECTORY_ENTRY_FREE) && strcasecmp(dirName, fileName) == 0) {
+                // mask the bits to get the next cluster
                 uint32_t clusterNumber_Dir = curr_dir->DIR_FstClusHI << MASKBY | curr_dir->DIR_FstClusLO;
-                getFileContent(bpb, clusterNumber_Dir);
-            } else if (curr_dir->DIR_Name[0] != 0xe5) {
-                char *name = malloc(sizeof(FILE_NAME_LENGTH));
-                char *extension = malloc(sizeof(EXTENSION_LENGTH));
+                // recurse on the next cluster
+                traverse_for_file(bs, clusterNumber_Dir);
+            } else if (curr_dir->DIR_Name[0] != DIRECTORY_ENTRY_FREE) {
+                char *dir_name = curr_dir->DIR_Name;
+                char *name = name_copier(dir_name, false);
+                char *ext = name_copier(dir_name, true);
                 
-                strncpy(name, curr_dir->DIR_Name, FILE_NAME_LENGTH);
-                strncpy(extension, curr_dir->DIR_Name + FILE_NAME_LENGTH, EXTENSION_LENGTH);
-                name = strtok(name, " ");
-                char *fileNameToCheck = (char *)malloc(sizeof(FILE_NAME_LENGTH + EXTENSION_LENGTH));
+                // tokenize the name
+                name_parser(name);
                 
-                strcat(fileNameToCheck, name);
-                strcat(fileNameToCheck, ".");
-                strcat(fileNameToCheck, extension);
-                if (strcasecmp(fileNameToCheck, fileName) == 0) {
+                char *file_name_to_check = concat_extension_to_file(name, ext);
+
+                // do case comparison on the file names
+                if (strcasecmp(file_name_to_check, fileName) == 0) {
                     
                     uint32_t clusterNumber_File = curr_dir->DIR_FstClusHI << MASKBY | curr_dir->DIR_FstClusLO;;
                     
-                    print_contents_of_the_file(bpb, clusterNumber_File, fileNameToCheck);
-                    uint32_t next_cluster = check_chain(bpb, clusterNumber_File);
+    
+                    // print the file and check for a chained cluster
+                    print_contents_of_the_file(bs, clusterNumber_File, file_name_to_check);
+                    uint32_t next_cluster = check_chain(bs, clusterNumber_File);
                     
                     // mask the first 4 bits
-                    next_cluster = next_cluster & 0xfffffff;
-                    while (next_cluster == 0xffffff8 || next_cluster == 0xfffffff) {
-                        print_contents_of_the_file(bpb, next_cluster, fileNameToCheck);
-                        next_cluster = check_chain(bpb, next_cluster);
-                        next_cluster = next_cluster & 0xfffffff;
+                    next_cluster = next_cluster & MASKFIRST4BITS;
+                    while (next_cluster == ENDOFCLUSTERCHAIN || next_cluster == MASKFIRST4BITS) {
+                        print_contents_of_the_file(bs, next_cluster, file_name_to_check);
+                        next_cluster = check_chain(bs, next_cluster);
+                        next_cluster = next_cluster & MASKFIRST4BITS;
                     }
                     fileFound = true;
                     return;
@@ -415,9 +439,21 @@ void getFileContent(fat32BS *bpb, uint32_t clusterNum) {
             }
         }
     }
-    uint32_t next_cluster = check_chain(bpb, clusterNum);
-    next_cluster = next_cluster & 0xfffffff;
-    if (next_cluster != 0xffffff8 && next_cluster != 0xfffffff) {
-        getFileContent(bpb, next_cluster);
-    }
-} // close getFileContent
+    
+    // tail recursion - base case
+    uint32_t next_cluster = check_chain(bs, clus_num);
+    // mask the first 4 bits
+    next_cluster = next_cluster & MASKFIRST4BITS;
+    if (next_cluster != ENDOFCLUSTERCHAIN && next_cluster != MASKFIRST4BITS) {
+        traverse_for_file(bs, next_cluster);
+    } // end if
+} // close traverse_for_file
+
+
+char *concat_extension_to_file(char *name, char *extension) {
+    char *file_name = malloc(sizeof(FILE_NAME_LENGTH + EXTENSION_LENGTH));
+    strcat(file_name, name);
+    strcat(file_name, ".");
+    strcat(file_name, extension);
+    return file_name;
+} // close concat_extension_to_file

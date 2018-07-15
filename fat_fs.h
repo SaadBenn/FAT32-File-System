@@ -37,25 +37,21 @@ typedef struct FS_Info {
 #pragma pack(pop)
 
 
-void ReadDiectories(uint32_t);
-
 // printing functions
-void PrintRootDirectory(uint32_t);
 int print_dir_recursively(fat32BS *, uint32_t, uint32_t);
 void print_info(fat32BS *);
 void print_contents_of_the_file(fat32BS *, uint32_t, char *);
 void print_dash(int);
 
-uint32_t getClusterNumber(uint16_t, uint16_t);
-
 // validate the directory
 bool is_directory(Dir_Info *currDir);
 
+// cluster management functions
 uint32_t check_chain(fat32BS *, uint32_t);
-void getFileContent(fat32BS *bpb, uint32_t);
-char *GetNextFolderToPath();
+void traverse_for_file(fat32BS *bpb, uint32_t);
 uint32_t get_sector_of_cluster(fat32BS *, uint32_t);
 
 char *tokenize_dir_file_name(char *);
-
 char *seek_and_read_file_contents(uint32_t, uint32_t);
+char *concat_extension_to_file(char *, char *);
+char *name_copier(char *, bool);
